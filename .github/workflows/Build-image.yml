@@ -1,0 +1,161 @@
+name: Build CardputerZero image
+
+# Take a base Raspberry Pi OS / CardputerZero image, bake the Shadow Games
+# launcher into it (offline-ready), and publish a flashable .img.xz.
+#
+# Run it from Actions -> "Build CardputerZero image" -> Run workflow,
+# or push a tag like v0.1 to also create a GitHub Release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image_url:
+        description: "Base image URL (.img.xz). Use the official CardputerZero image if you have one."
+        required: false
+        default: "https://downloads.raspberrypi.com/raspios_lite_arm64_latest"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  # Repo variable BASE_IMAGE_URL overrides the default when set.
+  DEFAULT_BASE_URL: "https://downloads.raspberrypi.com/raspios_lite_arm64_latest"
+  IMAGE_NAME: shadow-games-cardputerzero
+  EXTRA_SPACE_MB: "1024"
+
+  # ---- EDIT THESE to match your app (firstrun.sh was not visible to me) ----
+  APP_SRC: app                      # folder in the repo to bake in
+  APP_DEST: /opt/shadow-games       # where it lives on the device
+  APP_ENTRY: main.py                # entry script inside APP_SRC
+  APT_PACKAGES: >-
+    python3 python3-pip python3-venv xterm network-manager bluez
+    rtl-sdr librtlsdr-dev
+  PIP_PACKAGES: "nfcpy"             # space separated, installed system-wide
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support xz-utils \
+            util-linux e2fsprogs parted rsync curl
+
+      - name: Download base image
+        run: |
+          URL="${{ github.event.inputs.base_image_url }}"
+          URL="${URL:-${{ vars.BASE_IMAGE_URL }}}"
+          URL="${URL:-$DEFAULT_BASE_URL}"
+          echo "Base image: $URL"
+          curl -L --fail --retry 3 -o base.img.xz "$URL"
+          xz -d -T0 base.img.xz
+          mv base.img "$IMAGE_NAME.img"
+          ls -lh "$IMAGE_NAME.img"
+
+      - name: Grow image to make room
+        run: |
+          truncate -s +${EXTRA_SPACE_MB}M "$IMAGE_NAME.img"
+          echo ", +" | sudo sfdisk -N 2 "$IMAGE_NAME.img"
+
+      - name: Attach and mount
+        run: |
+          LOOP=$(sudo losetup -fP --show "$IMAGE_NAME.img")
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+          sudo e2fsck -fy "${LOOP}p2" || true
+          sudo resize2fs "${LOOP}p2"
+          mkdir -p rootfs
+          sudo mount "${LOOP}p2" rootfs
+          # Bookworm+ mounts the boot partition at /boot/firmware
+          if [ -d rootfs/boot/firmware ]; then BOOT=rootfs/boot/firmware; else BOOT=rootfs/boot; fi
+          sudo mount "${LOOP}p1" "$BOOT"
+          echo "BOOT=$BOOT" >> "$GITHUB_ENV"
+
+      - name: Copy app and setup files in
+        run: |
+          sudo mkdir -p "rootfs${APP_DEST}"
+          sudo rsync -a "${APP_SRC}/" "rootfs${APP_DEST}/"
+          sudo mkdir -p rootfs/opt/shadow-games-setup
+          sudo rsync -a setup/ rootfs/opt/shadow-games-setup/
+
+      - name: Write systemd service
+        run: |
+          sudo tee rootfs/etc/systemd/system/shadow-games.service >/dev/null <<EOF
+          [Unit]
+          Description=Shadow Games launcher (CardputerZero)
+          After=multi-user.target network.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=${APP_DEST}
+          ExecStart=/usr/bin/python3 ${APP_DEST}/${APP_ENTRY}
+          Restart=always
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+      - name: Install packages and enable service (ARM chroot)
+        run: |
+          sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+          sudo mount --bind /dev rootfs/dev
+          sudo mount --bind /dev/pts rootfs/dev/pts
+          sudo mount -t proc proc rootfs/proc
+          sudo mount -t sysfs sys rootfs/sys
+          # Temporary DNS inside the chroot
+          sudo mv rootfs/etc/resolv.conf rootfs/etc/resolv.conf.bak || true
+          sudo cp /etc/resolv.conf rootfs/etc/resolv.conf
+
+          sudo chroot rootfs /bin/bash -euxc "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends ${APT_PACKAGES}
+            if [ -n '${PIP_PACKAGES}' ]; then
+              pip3 install --break-system-packages ${PIP_PACKAGES}
+            fi
+            systemctl enable shadow-games.service
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+          "
+
+          sudo rm -f rootfs/etc/resolv.conf
+          sudo mv rootfs/etc/resolv.conf.bak rootfs/etc/resolv.conf || true
+          sudo rm -f rootfs/usr/bin/qemu-aarch64-static
+
+      - name: Unmount and detach
+        if: always()
+        run: |
+          sync
+          sudo umount -R rootfs || true
+          [ -n "$LOOP" ] && sudo losetup -d "$LOOP" || true
+
+      - name: Compress
+        run: |
+          xz -T0 -6 "$IMAGE_NAME.img"
+          sha256sum "$IMAGE_NAME.img.xz" > "$IMAGE_NAME.img.xz.sha256"
+          ls -lh "$IMAGE_NAME.img.xz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IMAGE_NAME }}
+          path: |
+            ${{ env.IMAGE_NAME }}.img.xz
+            ${{ env.IMAGE_NAME }}.img.xz.sha256
+          retention-days: 14
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.IMAGE_NAME }}.img.xz
+            ${{ env.IMAGE_NAME }}.img.xz.sha256
