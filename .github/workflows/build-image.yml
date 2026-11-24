@@ -1,0 +1,56 @@
+name: Build Shadow Games Cardputer Zero Image
+
+on:
+workflow_dispatch:
+
+jobs:
+build:
+runs-on: ubuntu-24.04
+
+steps:
+- name: Get Shadow Games source
+uses: actions/checkout@v4
+
+- name: Install image tools
+run: |
+sudo apt-get update
+sudo apt-get install -y \
+xz-utils \
+libguestfs-tools \
+tar
+
+- name: Download Cardputer Zero OS
+run: |
+curl -fL \
+"https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/cardputerzero-trixie-arm64-latest.img.xz" \
+-o shadow-games-base.img.xz
+
+- name: Extract operating system
+run: |
+xz -dk shadow-games-base.img.xz
+ls -lh shadow-games-base.img
+
+- name: Prepare Shadow Games files
+run: |
+tar -cf shadow-games-app.tar -C app .
+
+- name: Install Shadow Games files into image
+run: |
+sudo guestfish --rw -a shadow-games-base.img -i <<EOF
+mkdir-p /boot/shadow-games-app
+tar-in shadow-games-app.tar /boot/shadow-games-app
+copy-in setup/firstrun.sh /boot
+EOF
+
+- name: Compress final image
+run: |
+xz -T0 -3 shadow-games-base.img
+mv shadow-games-base.img.xz Shadow-Games-Cardputer-Zero.img.xz
+
+- name: Upload image
+uses: actions/upload-artifact@v4
+with:
+name: Shadow-Games-Cardputer-Zero-Image
+path: Shadow-Games-Cardputer-Zero.img.xz
+compression-level: 0
+retention-days: 14
