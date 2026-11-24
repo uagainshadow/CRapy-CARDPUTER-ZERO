@@ -1,0 +1,224 @@
+name: Build Shadow Games Cardputer Zero Image
+
+on:
+workflow_dispatch:
+push:
+branches:
+- main
+paths:
+- "app/**"
+- "setup/**"
+- ".github/workflows/shadow-games-image.yml"
+- "README.md"
+
+permissions:
+contents: write
+
+jobs:
+build-cardputerzero-image:
+runs-on: ubuntu-24.04-arm
+timeout-minutes: 180
+
+steps:
+- name: Check out Shadow Games
+uses: actions/checkout@v4
+with:
+path: shadow-games
+
+- name: Install pi-gen build dependencies
+run: |
+sudo apt-get update
+sudo apt-get install -y \
+coreutils quilt parted debootstrap zerofree zip \
+dosfstools libarchive-tools libcap2-bin grep rsync xz-utils \
+file git curl bc gpg pigz xxd arch-test qemu-user-static \
+kmod binfmt-support e2fsprogs
+
+- name: Get M5Stack Cardputer Zero image builder
+run: |
+git clone --depth 1 --branch cardputerzero_v1.1 \
+https://github.com/CardputerZero/pi-gen.git pi-gen
+
+- name: Add Shadow Games to the Cardputer Zero OS build
+run: |
+set -euo pipefail
+
+STAGE="pi-gen/stage4/99-shadow-games"
+mkdir -p "$STAGE/files/shadow-games"
+
+cp -a shadow-games/app/. "$STAGE/files/shadow-games/"
+
+cat > "$STAGE/00-run.sh" <<'HOST_SCRIPT'
+#!/bin/bash -e
+install -d "${ROOTFS_DIR}/opt/shadow-games"
+cp -a files/shadow-games/. "${ROOTFS_DIR}/opt/shadow-games/"
+HOST_SCRIPT
+
+cat > "$STAGE/01-run-chroot.sh" <<'CHROOT_SCRIPT'
+#!/bin/bash -e
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+python3-pip python3-pygame \
+rtl-sdr librtlsdr-dev \
+libnfc-bin libnfc-dev pcscd pcsc-tools libpcsclite-dev \
+network-manager bluez git xterm
+
+python3 -m pip install --break-system-packages \
+pyrtlsdr nfcpy pyscard
+
+cat > /etc/systemd/system/shadow-games.service <<'SERVICE'
+[Unit]
+Description=Shadow Games kiosk app
+After=multi-user.target
+
+[Service]
+Type=simple
+Environment=SDL_FBDEV=/dev/fb0
+WorkingDirectory=/opt/shadow-games
+ExecStart=/usr/bin/python3 /opt/shadow-games/main.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl enable shadow-games.service
+CHROOT_SCRIPT
+
+chmod +x "$STAGE/00-run.sh" "$STAGE/01-run-chroot.sh"
+
+- name: Configure Cardputer Zero image
+working-directory: pi-gen
+run: |
+cat > config <<'CONFIG'
+IMG_NAME=shadow-games-cardputerzero
+IMG_FILENAME=shadow-games-cardputerzero
+ARCHIVE_FILENAME=shadow-games-cardputerzero
+RELEASE=trixie
+DEPLOY_COMPRESSION=xz
+TARGET_HOSTNAME=cardputerzero
+FIRST_USER_NAME=pi
+FIRST_USER_PASS=raspberry
+ENABLE_SSH=1
+LOCALE_DEFAULT=en_US.UTF-8
+KEYBOARD_KEYMAP=us
+KEYBOARD_LAYOUT="English (US)"
+TIMEZONE_DEFAULT=America/New_York
+IMAGE_TOTAL_SIZE=15888023552
+CONFIG
+
+touch stage5/SKIP stage5/SKIP_IMAGES
+
+- name: Build bootable Cardputer Zero image
+working-directory: pi-gen
+env:
+XZ_DEFAULTS: "-T0"
+run: |
+sudo ./build.sh
+sudo chown -R "$(id -u):$(id -g)" deploy
+
+- name: Find image and calculate checksums
+id: image
+working-directory: pi-gen
+run: |
+set -euo pipefail
+
+IMAGE="$(find deploy -type f -name '*.img.xz' ! -name '*lite*' | sort | head -n 1)"
+
+if [ -z "$IMAGE" ]; then
+echo "::error::No Cardputer Zero image was produced."
+find deploy -type f -maxdepth 3 -print
+exit 1
+fi
+
+xz -t "$IMAGE"
+
+echo "path=$IMAGE" >> "$GITHUB_OUTPUT"
+echo "name=$(basename "$IMAGE")" >> "$GITHUB_OUTPUT"
+echo "download_size=$(stat -c '%s' "$IMAGE")" >> "$GITHUB_OUTPUT"
+echo "download_sha256=$(sha256sum "$IMAGE" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+echo "raw_size=$(xz -dc "$IMAGE" | wc -c | tr -d ' ')" >> "$GITHUB_OUTPUT"
+echo "raw_sha256=$(xz -dc "$IMAGE" | sha256sum | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+- name: Create GitHub release and M5 Imager manifest
+working-directory: pi-gen
+env:
+GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+IMAGE_PATH: ${{ steps.image.outputs.path }}
+run: |
+set -euo pipefail
+
+TAG="shadow-games-$(date -u +%Y%m%d-%H%M%S)"
+IMAGE_NAME="$(basename "$IMAGE_PATH")"
+IMAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IMAGE_NAME}"
+
+IMAGE_RAW_SIZE="$(xz -dc "$IMAGE_PATH" | wc -c | tr -d ' ')"
+IMAGE_RAW_SHA256="$(xz -dc "$IMAGE_PATH" | sha256sum | awk '{print $1}')"
+IMAGE_DOWNLOAD_SIZE="$(stat -c '%s' "$IMAGE_PATH")"
+IMAGE_DOWNLOAD_SHA256="$(sha256sum "$IMAGE_PATH" | awk '{print $1}')"
+
+python3 - "$IMAGE_URL" "$IMAGE_RAW_SIZE" "$IMAGE_RAW_SHA256" "$IMAGE_DOWNLOAD_SIZE" "$IMAGE_DOWNLOAD_SHA256" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+url, raw_size, raw_sha, download_size, download_sha = sys.argv[1:]
+
+manifest = {
+"imager": {
+"latest_version": "1.0.0",
+"url": "https://github.com/CardputerZero/m5stack-imager",
+"devices": [
+{
+"name": "CardputerZero",
+"description": "M5Stack Cardputer Zero",
+"icon": "https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/icons/cardputerzero.png",
+"tags": ["m5-cardputerzero", "pi3-64bit", "pi3-32bit"],
+"default": True,
+"matching_type": "exclusive",
+"architecture": "armv8",
+"capabilities": ["i2c", "spi", "serial", "usb_otg"]
+}
+]
+},
+"os_list": [
+{
+"name": "Shadow Games OS (Cardputer Zero)",
+"description": "Cardputer Zero Trixie arm64 desktop with Shadow Games installed.",
+"icon": "https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/icons/cardputerzero.png",
+"url": url,
+"extract_size": int(raw_size),
+"extract_sha256": raw_sha,
+"image_download_size": int(download_size),
+"image_download_sha256": download_sha,
+"release_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+"init_format": "systemd",
+"devices": ["m5-cardputerzero", "pi3-64bit"],
+"architecture": "armv8",
+"capabilities": ["i2c", "spi", "serial", "usb_otg"]
+}
+]
+}
+
+with open("os-list.json", "w", encoding="utf-8") as f:
+json.dump(manifest, f, indent=2)
+f.write("\n")
+PY
+
+gh release create "$TAG" "$IMAGE_PATH" os-list.json \
+--title "Shadow Games Cardputer Zero ${TAG}" \
+--notes "Bootable Cardputer Zero image with Shadow Games installed."
+
+echo "M5_IMAGER_MANIFEST=https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/os-list.json" >> "$GITHUB_STEP_SUMMARY"
+echo "IMAGE_DOWNLOAD=${IMAGE_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+- name: Upload image artifact
+uses: actions/upload-artifact@v4
+with:
+name: shadow-games-cardputerzero-image
+path: pi-gen/${{ steps.image.outputs.path }}
+if-no-files-found: error
+retention-days: 30
