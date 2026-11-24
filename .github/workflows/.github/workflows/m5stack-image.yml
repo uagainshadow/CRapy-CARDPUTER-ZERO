@@ -1,0 +1,76 @@
+name: Shadow Games - M5Stack Image Package
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+jobs:
+package:
+runs-on: ubuntu-24.04
+
+steps:
+- name: Checkout Shadow Games
+uses: actions/checkout@v4
+
+- name: Install tools
+run: |
+sudo apt-get update
+sudo apt-get install -y xz-utils jq
+
+- name: Find built Cardputer Zero image
+run: |
+IMAGE=$(find . -type f -name "*.img" \
+! -path "./.git/*" | head -n 1)
+
+if [ -z "$IMAGE" ]; then
+echo "ERROR: No complete .img disk image found."
+echo "A bootable Cardputer Zero image must be built first."
+exit 1
+fi
+
+mkdir -p output
+cp "$IMAGE" output/Shadow-Games-CardputerZero.img
+
+- name: Compress image
+run: |
+cd output
+xz -T0 -3 Shadow-Games-CardputerZero.img
+
+- name: Generate image metadata
+run: |
+cd output
+
+IMAGE="Shadow-Games-CardputerZero.img.xz"
+
+DOWNLOAD_SIZE=$(stat -c%s "$IMAGE")
+DOWNLOAD_SHA=$(sha256sum "$IMAGE" | awk '{print $1}')
+
+EXTRACT_SIZE=$(xz -l "$IMAGE" | awk 'END {print $5}')
+
+EXTRACT_SHA=$(xz -dc "$IMAGE" | sha256sum | awk '{print $1}')
+
+cat > shadow-games-metadata.json <<EOF
+{
+"name": "Shadow Games",
+"description": "Shadow Games OS for M5Stack CardputerZero",
+"extract_size": $EXTRACT_SIZE,
+"extract_sha256": "$EXTRACT_SHA",
+"image_download_size": $DOWNLOAD_SIZE,
+"image_download_sha256": "$DOWNLOAD_SHA",
+"release_date": "$(date -u +%Y-%m-%d)",
+"init_format": "systemd",
+"devices": ["m5-cardputerzero", "pi3-64bit"],
+"architecture": "armv8",
+"capabilities": ["i2c", "spi", "serial", "usb_otg"]
+}
+EOF
+
+- name: Upload M5Stack image package
+uses: actions/upload-artifact@v4
+with:
+name: Shadow-Games-M5Stack-Image
+path: output/
+compression-level: 0
+retention-days: 30
